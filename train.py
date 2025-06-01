@@ -8,6 +8,10 @@ from flax.training import train_state
 import numpy as np
 import optax
 
+import time
+
+import functools
+
 BATCH_SIZE = 384
 SEQUENCE_LEN = 128
 
@@ -15,9 +19,27 @@ VOCAB_DIM = 256
 EMBED_DIM = 512
 FF_DIM = 2048
 
-LAYERS = 4
+NUM_HEAD = 4
+HEAD_DIM = 128
+
+LAYERS = 2
 
 LEARNING_RATE = 1e-3
+
+FSDP = 4
+TENSOR = 1
+
+
+def attention(Q, K, V):
+    weights_unnormalized = jnp.einsum("bshd,bthd->bhst", Q, K)
+    weights_unnormalized_to_zero_out = jnp.triu(
+        jnp.ones((SEQUENCE_LEN, SEQUENCE_LEN), dtype=jnp.bfloat16), k=1
+    )
+    weights = jax.nn.softmax(
+        weights_unnormalized - 1e6 * weights_unnormalized_to_zero_out
+    )
+    output = jnp.einsum("bhst,bthd->bshd", weights, V)
+    return output
 
 
 class Model(nn.Module):
@@ -25,14 +47,25 @@ class Model(nn.Module):
     def __call__(self, x):
         """inputs is [BATCH_SIZE, SEQUENCE_LEN]"""
         embedding = self.param(
-            "embedding", nn.initializers.normal(1), (VOCAB_DIM, EMBED_DIM), jnp.float32
+            "embedding",
+            nn.with_partitioning(nn.initializers.normal(1), ("tp", "fsdp")),
+            (VOCAB_DIM, EMBED_DIM),
+            jnp.float32,
         )
-        x = jnp.asarray(embedding)[x]
+        x = jnp.asarray(embedding)[x]  # output should be [BATCH, SEQUENCE, EMBED]
+
+        positional_embedding = self.param(
+            "positional_embedding",
+            nn.with_partitioning(nn.initializers.normal(1), (None, None, "fsdp")),
+            (1, SEQUENCE_LEN, EMBED_DIM),
+            jnp.float32,
+        )
+        x += positional_embedding
 
         for i in range(LAYERS):
             feedforward = self.param(
                 "feedforward_" + str(i),
-                nn.initializers.lecun_normal(),
+                nn.with_partitioning(nn.initializers.lecun_normal(), ("fsdp", "tp")),
                 (EMBED_DIM, FF_DIM),
                 jnp.float32,
             )
@@ -40,12 +73,44 @@ class Model(nn.Module):
             x = jax.nn.relu(x)
             embed = self.param(
                 "embed_" + str(i),
-                nn.initializers.lecun_normal(),
+                nn.with_partitioning(nn.initializers.lecun_normal(), ("tp", "fsdp")),
                 (FF_DIM, EMBED_DIM),
                 jnp.float32,
             )
             x = x @ embed
             x = jax.nn.relu(x)
+
+            q_proj = self.param(
+                "qproj_" + str(i),
+                nn.with_partitioning(nn.initializers.lecun_normal(), ("fsdp", "tp")),
+                (EMBED_DIM, NUM_HEAD, HEAD_DIM),
+                jnp.float32,
+            )
+            q = jnp.einsum("BSE,EHD->BSHD", x, q_proj)
+            k_proj = self.param(
+                "kproj_" + str(i),
+                nn.with_partitioning(nn.initializers.lecun_normal(), ("fsdp", "tp")),
+                (EMBED_DIM, NUM_HEAD, HEAD_DIM),
+                jnp.float32,
+            )
+            k = jnp.einsum("BSE,EHD->BSHD", x, k_proj)
+            v_proj = self.param(
+                "vproj_" + str(i),
+                nn.with_partitioning(nn.initializers.lecun_normal(), ("fsdp", "tp")),
+                (EMBED_DIM, NUM_HEAD, HEAD_DIM),
+                jnp.float32,
+            )
+            v = jnp.einsum("BSE,EHD->BSHD", x, v_proj)
+
+            o = attention(q, k, v)
+            o_proj = self.param(
+                "oproj_" + str(i),
+                nn.with_partitioning(nn.initializers.lecun_normal(), ("fsdp", "tp")),
+                (NUM_HEAD, HEAD_DIM, EMBED_DIM),
+                jnp.float32,
+            )
+            x = jnp.einsum("BSHD,HDE->BSE", o, o_proj)
+
         return x @ jnp.asarray(embedding).T
 
 
@@ -72,28 +137,56 @@ def calculate_loss(params, model, inputs, outputs):
     return jnp.mean(loss)
 
 
+def step(state, model, inputs, outputs):
+    loss, grad = jax.value_and_grad(calculate_loss)(
+        state.params, model, inputs, outputs
+    )
+    state = state.apply_gradients(grads=grad)
+    return loss, state
+
+
 def main():
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()).reshape(FSDP, TENSOR), ("fsdp", "tp")
+    )
+
     ds = tfds.load("lm1b", split="train", shuffle_files=False)
     ds = ds.batch(BATCH_SIZE)
+
     rngkey = jax.random.key(0)
     model = Model()
-    init_params = model.init(
-        rngkey, jnp.ones((BATCH_SIZE, SEQUENCE_LEN), dtype=jnp.uint8)
+    shape_init = jax.eval_shape(
+        functools.partial(model.init, rngkey),
+        jax.ShapeDtypeStruct((BATCH_SIZE, SEQUENCE_LEN), dtype=jnp.uint8),
     )
+    state_sharding = nn.get_sharding(shape_init, mesh)
+    init_params = jax.jit(model.init, out_shardings=state_sharding)(
+        rngkey, jax.ShapeDtypeStruct((BATCH_SIZE, SEQUENCE_LEN), dtype=jnp.uint8)
+    )
+
     tx = optax.adam(learning_rate=LEARNING_RATE)
     state = train_state.TrainState.create(
         apply_fn=model.apply, params=init_params, tx=tx
     )
 
     it = 0
+    static_step = jax.jit(step, static_argnums=1)
+    stepnum = 0
+
+    last_step_time = time.time()
     for example in ds:
         outputs = convert_to_ascii(example["text"].numpy(), SEQUENCE_LEN)
         inputs = input_to_output(outputs)
-        loss, grad = jax.value_and_grad(calculate_loss)(
-            state.params, model, inputs, outputs
-        )
-        state = state.apply_gradients(grads=grad)
-        print(f"{it} -> {loss}")
+        loss, state = static_step(state, model, inputs, outputs)
+
+        stepnum += 1
+        # data overloading
+        if stepnum % 10 == 0:
+            new_time = time.time()
+            time_elapsed_seconds = new_time - last_step_time
+            last_step_time = new_time
+            print(f"{stepnum} -> {loss} {time_elapsed_seconds}")
+
         it += 1
 
 
