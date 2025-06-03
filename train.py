@@ -16,18 +16,25 @@ BATCH_SIZE = 384
 SEQUENCE_LEN = 128
 
 VOCAB_DIM = 256
-EMBED_DIM = 512
-FF_DIM = 2048
+EMBED_DIM = 2048
+FF_DIM = 8192
 
 NUM_HEAD = 4
 HEAD_DIM = 128
 
-LAYERS = 2
+LAYERS = 8
 
 LEARNING_RATE = 1e-3
 
 FSDP = 4
 TENSOR = 1
+
+LOG_PERIOD = 10
+
+mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape(FSDP, TENSOR), ("fsdp", "tp"))
+desired_embedding_sharding = jax.sharding.NamedSharding(
+    mesh, jax.sharding.PartitionSpec("fsdp", None, "tp")
+)  # apply to BATCH, SEQUENCE, EMBED
 
 
 def attention(Q, K, V):
@@ -61,6 +68,7 @@ class Model(nn.Module):
             jnp.float32,
         )
         x += positional_embedding
+        x = jax.lax.with_sharding_constraint(x, desired_embedding_sharding)
 
         for i in range(LAYERS):
             feedforward = self.param(
@@ -71,6 +79,7 @@ class Model(nn.Module):
             )
             x = x @ feedforward
             x = jax.nn.relu(x)
+            x = jax.lax.with_sharding_constraint(x, desired_embedding_sharding)
             embed = self.param(
                 "embed_" + str(i),
                 nn.with_partitioning(nn.initializers.lecun_normal(), ("tp", "fsdp")),
@@ -110,6 +119,7 @@ class Model(nn.Module):
                 jnp.float32,
             )
             x = jnp.einsum("BSHD,HDE->BSE", o, o_proj)
+            x = jax.lax.with_sharding_constraint(x, desired_embedding_sharding)
 
         return x @ jnp.asarray(embedding).T
 
@@ -145,16 +155,18 @@ def step(state, model, inputs, outputs):
     return loss, state
 
 
-def main():
-    mesh = jax.sharding.Mesh(
-        np.array(jax.devices()).reshape(FSDP, TENSOR), ("fsdp", "tp")
-    )
+def calculate_num_params(pytree):
+    sizes = jax.tree_util.tree_map(lambda x: x.size, pytree)
+    return jax.tree_util.tree_reduce(lambda x, y: x + y, sizes)
 
+
+def main():
     ds = tfds.load("lm1b", split="train", shuffle_files=False)
     ds = ds.batch(BATCH_SIZE)
 
     rngkey = jax.random.key(0)
     model = Model()
+
     shape_init = jax.eval_shape(
         functools.partial(model.init, rngkey),
         jax.ShapeDtypeStruct((BATCH_SIZE, SEQUENCE_LEN), dtype=jnp.uint8),
@@ -163,6 +175,10 @@ def main():
     init_params = jax.jit(model.init, out_shardings=state_sharding)(
         rngkey, jax.ShapeDtypeStruct((BATCH_SIZE, SEQUENCE_LEN), dtype=jnp.uint8)
     )
+
+    num_total_params = calculate_num_params(init_params)
+    num_total_flops = 6 * BATCH_SIZE * SEQUENCE_LEN * num_total_params
+    num_total_flops_per_device = num_total_flops / jax.device_count()
 
     tx = optax.adam(learning_rate=LEARNING_RATE)
     state = train_state.TrainState.create(
@@ -181,11 +197,17 @@ def main():
 
         stepnum += 1
         # data overloading
-        if stepnum % 10 == 0:
+        if stepnum % LOG_PERIOD == 0:
             new_time = time.time()
             time_elapsed_seconds = new_time - last_step_time
             last_step_time = new_time
             print(f"{stepnum} -> {loss} {time_elapsed_seconds}")
+            per_device_tflops_completed_in_interval = (
+                num_total_flops_per_device * LOG_PERIOD / 1e12
+            )
+            print(
+                f"TFLOPS/s/device: {per_device_tflops_completed_in_interval / time_elapsed_seconds}"
+            )
 
         it += 1
 
