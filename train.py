@@ -12,29 +12,35 @@ import time
 
 import functools
 
+import orbax.checkpoint as ocp
+
+import os
+
 BATCH_SIZE = 384
 SEQUENCE_LEN = 128
 
 VOCAB_DIM = 256
-EMBED_DIM = 2048
-FF_DIM = 8192
+EMBED_DIM = 1024
+FF_DIM = 4096
 
 NUM_HEAD = 4
 HEAD_DIM = 128
 
 LAYERS = 8
 
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-6
 
 FSDP = 4
 TENSOR = 1
 
 LOG_PERIOD = 10
+CHECKPOINT_PERIOD = 1000
 
 mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape(FSDP, TENSOR), ("fsdp", "tp"))
 desired_embedding_sharding = jax.sharding.NamedSharding(
     mesh, jax.sharding.PartitionSpec("fsdp", None, "tp")
 )  # apply to BATCH, SEQUENCE, EMBED
+home_dir = os.environ["HOME"]
 
 
 def attention(Q, K, V):
@@ -61,16 +67,18 @@ class Model(nn.Module):
         )
         x = jnp.asarray(embedding)[x]  # output should be [BATCH, SEQUENCE, EMBED]
 
-        positional_embedding = self.param(
-            "positional_embedding",
-            nn.with_partitioning(nn.initializers.normal(1), (None, None, "fsdp")),
-            (1, SEQUENCE_LEN, EMBED_DIM),
-            jnp.float32,
-        )
-        x += positional_embedding
-        x = jax.lax.with_sharding_constraint(x, desired_embedding_sharding)
-
         for i in range(LAYERS):
+            x = nn.LayerNorm(name="layer_norm_" + str(i))(x)
+           
+            positional_embedding = self.param(
+                "positional_embedding_" + str(i),
+                nn.with_partitioning(nn.initializers.normal(1), (None, None, "fsdp")),
+                (1, SEQUENCE_LEN, EMBED_DIM),
+                jnp.float32,
+            )
+            x += positional_embedding
+            x = jax.lax.with_sharding_constraint(x, desired_embedding_sharding)
+
             feedforward = self.param(
                 "feedforward_" + str(i),
                 nn.with_partitioning(nn.initializers.lecun_normal(), ("fsdp", "tp")),
@@ -185,7 +193,6 @@ def main():
         apply_fn=model.apply, params=init_params, tx=tx
     )
 
-    it = 0
     static_step = jax.jit(step, static_argnums=1)
     stepnum = 0
 
@@ -194,6 +201,11 @@ def main():
         outputs = convert_to_ascii(example["text"].numpy(), SEQUENCE_LEN)
         inputs = input_to_output(outputs)
         loss, state = static_step(state, model, inputs, outputs)
+
+        if stepnum % CHECKPOINT_PERIOD == 0:
+            checkpointer = ocp.StandardCheckpointer()
+            checkpointer.save(f"{home_dir}/HighPerformanceLLM/checkpoint/checkpoint_{stepnum:07}", state)
+            print(f"Saved checkpoint at {stepnum}")
 
         stepnum += 1
         # data overloading
@@ -208,8 +220,6 @@ def main():
             print(
                 f"TFLOPS/s/device: {per_device_tflops_completed_in_interval / time_elapsed_seconds}"
             )
-
-        it += 1
 
 
 if __name__ == "__main__":
