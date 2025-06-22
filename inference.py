@@ -36,7 +36,9 @@ FSDP = 1
 TENSOR = 1
 
 
-mesh = jax.sharding.Mesh(np.array(jax.devices()[0]).reshape(FSDP, TENSOR), ("fsdp", "tp"))
+mesh = jax.sharding.Mesh(
+    np.array(jax.devices()[0]).reshape(FSDP, TENSOR), ("fsdp", "tp")
+)
 desired_embedding_sharding = jax.sharding.NamedSharding(
     mesh, jax.sharding.PartitionSpec("fsdp", None, "tp")
 )  # apply to BATCH, SEQUENCE, EMBED
@@ -46,7 +48,7 @@ home_dir = os.environ["HOME"]
 def attention_with_masking(Q, K, V, seq_pos):
     query_segment_id = jnp.ones((1, Q.shape[1]), dtype=jnp.int32)
     kv_segment_id = jnp.ones((1, SEQUENCE_LEN), dtype=jnp.int32) * jnp.expand_dims(
-        jnp.arange(SEQUENCE_LEN) <= seq_pos, axis = 0
+        jnp.arange(SEQUENCE_LEN) <= seq_pos, axis=0
     )
 
     segment_ids = pallas_attention.SegmentIds(q=query_segment_id, kv=kv_segment_id)
@@ -56,10 +58,10 @@ def attention_with_masking(Q, K, V, seq_pos):
             jnp.swapaxes(K, 1, 2),
             jnp.swapaxes(V, 1, 2),
             None,
-            segment_ids=segment_ids
+            segment_ids=segment_ids,
         ),
         1,
-        2
+        2,
     )
 
 
@@ -77,7 +79,7 @@ class Model(nn.Module):
 
         for i in range(LAYERS):
             x = nn.LayerNorm(name="layer_norm_" + str(i))(x)
-           
+
             positional_embedding = self.param(
                 "positional_embedding_" + str(i),
                 nn.with_partitioning(nn.initializers.normal(1), (None, None, "fsdp")),
@@ -112,7 +114,7 @@ class Model(nn.Module):
                 jnp.float32,
             )
             q = jnp.einsum("BSE,EHD->BSHD", x, q_proj)
-            
+
             k_proj = self.param(
                 "kproj_" + str(i),
                 nn.with_partitioning(nn.initializers.lecun_normal(), ("fsdp", "tp")),
@@ -120,7 +122,9 @@ class Model(nn.Module):
                 jnp.float32,
             )
             k = jnp.einsum("BSE,EHD->BSHD", x, k_proj)
-            kv_cache[f"key_{i}"] = jax.lax.dynamic_update_index_in_dim(kv_cache[f"key_{i}"], k, pos, 1)
+            kv_cache[f"key_{i}"] = jax.lax.dynamic_update_index_in_dim(
+                kv_cache[f"key_{i}"], k, pos, 1
+            )
             k = kv_cache[f"key_{i}"]
 
             v_proj = self.param(
@@ -130,7 +134,9 @@ class Model(nn.Module):
                 jnp.float32,
             )
             v = jnp.einsum("BSE,EHD->BSHD", x, v_proj)
-            kv_cache[f"value_{i}"] = jax.lax.dynamic_update_index_in_dim(kv_cache[f"value_{i}"], v, pos, 1)
+            kv_cache[f"value_{i}"] = jax.lax.dynamic_update_index_in_dim(
+                kv_cache[f"value_{i}"], v, pos, 1
+            )
             v = kv_cache[f"value_{i}"]
 
             o = attention_with_masking(q, k, v, pos)
@@ -211,13 +217,15 @@ def main():
     )
     state_sharding = nn.get_sharding(shape_init, mesh)
     init_params = jax.jit(model.init, out_shardings=state_sharding)(
-        rngkey, 
-        jax.ShapeDtypeStruct((BATCH_SIZE, 1), dtype=jnp.uint8), 
-        0, 
+        rngkey,
+        jax.ShapeDtypeStruct((BATCH_SIZE, 1), dtype=jnp.uint8),
+        0,
         kv_cache,
     )
 
-    num_total_floats = calculate_num_params(init_params) + calculate_num_params(kv_cache)
+    num_total_floats = calculate_num_params(init_params) + calculate_num_params(
+        kv_cache
+    )
     num_bytes_to_read = num_total_floats * 4
 
     print(f"Number bytes {num_bytes_to_read/1e9} GB")
@@ -230,11 +238,11 @@ def main():
     abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state)
     checkpointer = ocp.StandardCheckpointer()
     state = checkpointer.restore(
-        f"{home_dir}/HighPerformanceLLM/checkpoint/checkpoint_0078000", 
+        f"{home_dir}/HighPerformanceLLM/checkpoint/checkpoint_0078000",
         abstract_state,
     )
 
-    text = np.zeros((1, 1), dtype = np.int32)
+    text = np.zeros((1, 1), dtype=np.int32)
     NUM_TOKENS = 30
     output_string = ""
     for i in range(NUM_TOKENS):

@@ -69,7 +69,7 @@ class Model(nn.Module):
 
         for i in range(LAYERS):
             x = nn.LayerNorm(name="layer_norm_" + str(i))(x)
-           
+
             positional_embedding = self.param(
                 "positional_embedding_" + str(i),
                 nn.with_partitioning(nn.initializers.normal(1), (None, None, "fsdp")),
@@ -204,7 +204,10 @@ def main():
 
         if stepnum % CHECKPOINT_PERIOD == 0:
             checkpointer = ocp.StandardCheckpointer()
-            checkpointer.save(f"{home_dir}/HighPerformanceLLM/checkpoint/checkpoint_{stepnum:07}", state)
+            checkpointer.save(
+                f"{home_dir}/HighPerformanceLLM/checkpoint/checkpoint_{stepnum:07}",
+                state,
+            )
             print(f"Saved checkpoint at {stepnum}")
 
         stepnum += 1
